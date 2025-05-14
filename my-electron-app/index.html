@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>SUNDER</title>
+  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+  <style>
+    /* Ensure text and buttons are visible */
+    body {
+      background-color: #f3f4f6;
+      color: #1f2937;
+    }
+    
+    /* Default button styles */
+    button {
+      background-color: #92C7CF;
+      color: white;
+      border: 1px solid #82b7bf;
+      padding: 0.5rem 1rem;
+      border-radius: 0.25rem;
+      font-weight: 500;
+    }
+    
+    /* Hover state for buttons */
+    button:hover {
+      background-color: #82b7bf;
+    }
+    
+    /* Secondary button styles */
+    button.secondary {
+      background-color: white;
+      color: #92C7CF;
+      border: 1px solid #92C7CF;
+    }
+    
+    /* Hover state for secondary buttons */
+    button.secondary:hover {
+      background-color: #f0f9fa;
+    }
+    
+    /* Default link styles */
+    a {
+      color: inherit;
+      text-decoration: none;
+    }
+    
+    /* Ensure links inside buttons have proper styling */
+    a.button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background-color: #92C7CF;
+      color: white;
+      border: 1px solid #82b7bf;
+      padding: 0.5rem 1rem;
+      border-radius: 0.25rem;
+      font-weight: 500;
+      text-decoration: none;
+    }
+  </style>
+  <!-- The bundled JS will be linked here -->
+  <script defer src="./build/bundle.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+</body>
+</html>

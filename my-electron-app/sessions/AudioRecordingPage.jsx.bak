@@ -1,0 +1,2162 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { 
+  Mic, Pause, Play, Send, Clock, ChevronLeft, 
+  MessageCircle, Mail, FileText, CheckCircle, XCircle,
+  ExternalLink, Zap, AlertCircle, Settings
+} from 'lucide-react';
+import PatientService from '../services/PatientService';
+import SessionService from '../services/SessionService';
+import TemplateService from '../services/TemplateService';
+import AIService from '../services/AIService';
+import NoteViewerModal from '../components/NoteViewerModal';
+import StructuredTemplateForm from '../components/StructuredTemplateForm';
+
+// For fetch API in browser environments
+const fetchAPI = window.fetch || fetch;
+
+const AudioRecordingPage = ({ patientId, sessionType, sessionData }) => {
+  // Recording States
+  const [isRecording, setIsRecording] = useState(true);
+  const [recordingTime, setRecordingTime] = useState(0);
+  const [audioData, setAudioData] = useState([]);
+  const [processingAudio, setProcessingAudio] = useState(false);
+  const [audioLevels, setAudioLevels] = useState(Array(20).fill(10));
+  const [activeTab, setActiveTab] = useState('session');
+  const [isGeneratingNote, setIsGeneratingNote] = useState(false);
+  const [generationProgress, setGenerationProgress] = useState(0);
+  const timerRef = useRef(null);
+  const audioContextRef = useRef(null);
+  const analyserRef = useRef(null);
+  const micStreamRef = useRef(null);
+  const dataArrayRef = useRef(null);
+  const autoSaveIntervalRef = useRef(null);
+  const generationTimerRef = useRef(null);
+  
+  // Session content
+  const [sessionNotes, setSessionNotes] = useState({
+    data: null, // Start with null content to prevent phantom notes
+    assessment: '',
+    plan: ''
+  });
+  
+  // Template state - FORCE GENERIC TYPE
+  const [templateId, setTemplateId] = useState(null);
+  const [isCustomTemplate, setIsCustomTemplate] = useState(false);
+  
+  // Modal state for viewing past notes
+  const [viewingNoteId, setViewingNoteId] = useState(null);
+  
+  // Get patient information - safely
+  const [patient, setPatient] = useState({});
+  const [patientSessions, setPatientSessions] = useState([]);
+  const [sessionObj, setSessionObj] = useState(null);
+  
+  // Load patient data safely
+  useEffect(() => {
+    try {
+      const patientData = PatientService.getPatient(patientId) || {};
+      setPatient(patientData);
+      
+      // Load the active session if it's in the database
+      if (typeof sessionData === 'string') {
+        const sessionObj = SessionService.getSession(sessionData);
+        if (sessionObj) {
+          console.log('Found session in database:', sessionObj);
+          // If this is a template session, ensure the notes are populated
+          if (sessionObj.templateId && sessionObj.templateId.startsWith('template_')) {
+            const templateId = sessionObj.templateId.replace('template_', '');
+            
+            // If there are no notes yet but we have a template ID, try to load it directly
+            if (!sessionObj.notes || sessionObj.notes.trim() === '') {
+              console.log('Session has no notes but has template ID, trying to load template content');
+              
+              // Get template content directly
+              try {
+                const dbStr = localStorage.getItem('database.db');
+                if (dbStr) {
+                  const dbData = JSON.parse(dbStr);
+                  if (dbData && dbData.templates && Array.isArray(dbData.templates)) {
+                    const template = dbData.templates.find(t => t.id === templateId);
+                    if (template && template.format) {
+                      console.log('Found template in database, updating session notes');
+                      
+                      // Update the session with this content
+                      SessionService.updateSession(sessionData, { 
+                        notes: template.format 
+                      });
+                      
+                      // Also set to local state to avoid waiting for next render
+                      setSessionNotes({
+                        data: template.format,
+                        assessment: '',
+                        plan: ''
+                      });
+                    }
+                  }
+                }
+              } catch (e) {
+                console.error('Error loading template from database:', e);
+              }
+            }
+          }
+        }
+      }
+      
+      const sessions = SessionService.getPatientSessions(patientId) || [];
+      // Filter out any duplicates that might exist
+      const uniqueSessions = Array.from(new Map(sessions.map(session => [session.id, session])).values());
+      setPatientSessions(uniqueSessions);
+    } catch (error) {
+      console.error('Error loading patient data:', error);
+      setPatient({});
+      setPatientSessions([]);
+    }
+  }, [patientId, sessionData]);
+  
+  // UI states
+  const [emailRecipients, setEmailRecipients] = useState([]);
+  const [emailInput, setEmailInput] = useState('');
+  const [emailSubject, setEmailSubject] = useState('');
+  const [emailBody, setEmailBody] = useState('');
+  const [emailStatus, setEmailStatus] = useState(null); // 'sending', 'sent', 'error'
+
+  // Keep track of when we last saved to throttle saves
+  const lastSaveTime = useRef(Date.now());
+  
+  // Function to save session state
+  const saveSessionState = () => {
+    // Throttle saves to reduce performance impact - only save every 5 seconds
+    const now = Date.now();
+    if (now - lastSaveTime.current < 5000) {
+      return;
+    }
+    
+    console.log('Saving session state...');
+    lastSaveTime.current = now;
+    
+    // Find current session ID
+    const currentSession = SessionService.getSessions().find(s => 
+      s.patientId === patientId && s.status === 'in-progress'
+    );
+    
+    if (!currentSession) {
+      console.error('No in-progress session found to save');
+      return;
+    }
+    
+    // Combine all notes sections based on session type
+    let combinedNotes = '';
+    if (sessionType === 'dap') {
+      combinedNotes = `DATA:\n${sessionNotes.data}\n\nASSESSMENT:\n${sessionNotes.assessment}\n\nPLAN:\n${sessionNotes.plan}`;
+    } else if (sessionType === 'soap') {
+      combinedNotes = `SUBJECTIVE:\n${sessionNotes.data}\n\nOBJECTIVE:\n\n\nASSESSMENT:\n${sessionNotes.assessment}\n\nPLAN:\n${sessionNotes.plan}`;
+    } else if (isCustomTemplate && templateId) {
+      // For custom templates, store the JSON data directly
+      const dataToStore = sessionNotes.formValues ? JSON.stringify(sessionNotes.formValues) : sessionNotes.data;
+      combinedNotes = `SESSION CONTENT:\n${dataToStore}`;
+    } else {
+      combinedNotes = `SESSION CONTENT:\n${sessionNotes.data}`;
+    }
+    
+    // Additional metadata to save
+    const metadata = {
+      recordingTime,
+      isRecording,
+      lastSaved: new Date().toISOString(),
+      emailData: {
+        recipients: emailRecipients,
+        subject: emailSubject,
+        body: emailBody
+      },
+      activeTab,
+      // Store template information in metadata to ensure it's preserved
+      templateId: templateId || null,
+      isCustomTemplate: isCustomTemplate || false
+    };
+    
+    // Stringify metadata and store it as a JSON string in the notes field
+    const metadataStr = JSON.stringify(metadata);
+    
+    // Update the session with combined notes and session metadata
+    // We'll store the metadata in a special format that can be parsed later
+    const updatedNotes = `${combinedNotes}\n\n<!-- SESSION_METADATA: ${metadataStr} -->`;
+    
+    SessionService.updateSession(currentSession.id, {
+      notes: updatedNotes,
+      status: 'in-progress',
+      lastSavedAt: new Date().toISOString()
+    });
+    
+    console.log('Session state saved successfully');
+  };
+  
+  // Check for existing session data and load if present
+  useEffect(() => {
+    let metadata = null;
+    
+    console.log('🔄 [AudioRecordingPage] Loading session, data type:', typeof sessionData);
+    
+    if (sessionData) {
+      console.log('🔄 [AudioRecordingPage] Session data available:', 
+        typeof sessionData === 'string' ? sessionData : 'object');
+
+      // Check if this is a session ID being passed instead of full session data
+      if (typeof sessionData === 'string') {
+        console.log('🔄 [AudioRecordingPage] Looking up session by ID:', sessionData);
+        const sessionById = SessionService.getSession(sessionData);
+        console.log('🔄 [AudioRecordingPage] Session retrieved:', !!sessionById);
+        
+        if (sessionById) {
+          sessionData = sessionById;
+          setSessionObj(sessionById);
+          console.log('🔄 [AudioRecordingPage] Session notes length:', 
+            sessionById.notes ? sessionById.notes.length : 0);
+        } else {
+          console.error('🔄 [AudioRecordingPage] Session not found with ID:', sessionData);
+        }
+      } else {
+        console.log('🔄 [AudioRecordingPage] Using session object directly');
+        setSessionObj(sessionData);
+      }
+      
+      // Check for custom template in either templateId or sessionType (bug fix)
+      // The template ID could be in either property depending on how it was saved
+      const hasTemplateId = sessionData.templateId && sessionData.templateId.startsWith('template_');
+      const hasTemplateInSessionType = sessionData.sessionType && sessionData.sessionType.startsWith('template_');
+      
+      if (hasTemplateId || hasTemplateInSessionType) {
+        // Get the template ID from whichever field has it
+        const effectiveTemplateId = hasTemplateId ? sessionData.templateId : sessionData.sessionType;
+        console.log('🔄 [AudioRecordingPage] Detected custom template in field:', 
+          hasTemplateId ? 'templateId' : 'sessionType');
+        console.log('🔄 [AudioRecordingPage] Template ID value:', effectiveTemplateId);
+        
+        // Set the template ID in the component state
+        setTemplateId(effectiveTemplateId);
+        setIsCustomTemplate(true);
+        
+        // Get the raw template ID from the effective template ID
+        const templateId = effectiveTemplateId.replace('template_', '');
+        console.log('🔄 [AudioRecordingPage] Raw template ID:', templateId);
+        
+        // We'll use a multi-phase approach to get the template content
+        console.log('🔄 [AudioRecordingPage] Phase 1: Check TemplateService cache');
+        let templateFound = false;
+        let templateData = TemplateService.getTemplateSync(templateId);
+        
+        if (templateData && templateData.format) {
+          console.log('🔄 [AudioRecordingPage] Phase 1 SUCCESS - Found template format in cache, length:', 
+            templateData.format.length);
+          console.log('🔄 [AudioRecordingPage] Format preview:', templateData.format.substring(0, 100) + '...');
+          templateFound = true;
+          
+          // Apply this format to our session notes immediately
+          if (!sessionData.notes || sessionData.notes.trim() === '') {
+            console.log('🔄 [AudioRecordingPage] Updating session with template content');
+            sessionData.notes = templateData.format;
+            setSessionNotes({
+              data: templateData.format,
+              assessment: '',
+              plan: ''
+            });
+          }
+        } else {
+          console.log('🔄 [AudioRecordingPage] Phase 1 FAILED - Template not in TemplateService cache');
+        }
+        
+        if (!templateFound) {
+          console.log('🔄 [AudioRecordingPage] Phase 2: Direct database.db access');
+          try {
+            const dbStr = localStorage.getItem('database.db');
+            if (dbStr) {
+              console.log('🔄 [AudioRecordingPage] Found database.db in localStorage');
+              const dbData = JSON.parse(dbStr);
+              
+              if (dbData && dbData.templates && Array.isArray(dbData.templates)) {
+                console.log('🔄 [AudioRecordingPage] database.db has', dbData.templates.length, 'templates');
+                console.log('🔄 [AudioRecordingPage] Template IDs in database:', dbData.templates.map(t => t.id));
+                
+                const template = dbData.templates.find(t => t.id === templateId);
+                
+                if (template && template.format) {
+                  console.log('🔄 [AudioRecordingPage] Phase 2 SUCCESS - Found template in database.db');
+                  templateFound = true;
+                  console.log('🔄 [AudioRecordingPage] Format preview:', template.format.substring(0, 100) + '...');
+                  
+                  // Apply this format to our session notes immediately
+                  if (!sessionData.notes || sessionData.notes.trim() === '') {
+                    console.log('🔄 [AudioRecordingPage] Updating session with template content from database');
+                    sessionData.notes = template.format;
+                    setSessionNotes({
+                      data: template.format,
+                      assessment: '',
+                      plan: ''
+                    });
+                    
+                    // Also update the session in the service
+                    if (typeof sessionData === 'object' && sessionData.id) {
+                      SessionService.updateSession(sessionData.id, { notes: template.format });
+                    }
+                  }
+                } else {
+                  console.log('🔄 [AudioRecordingPage] Phase 2 FAILED - Template not found in database.db');
+                }
+              }
+            }
+          } catch (e) {
+            console.error('🔄 [AudioRecordingPage] Phase 2 ERROR:', e);
+          }
+        }
+        
+        if (!templateFound) {
+          console.log('🔄 [AudioRecordingPage] Phase 3: Try async loading');
+          TemplateService.getTemplate(templateId).then(template => {
+            if (template && template.format) {
+              console.log('🔄 [AudioRecordingPage] Phase 3 SUCCESS - Template loaded asynchronously');
+              console.log('🔄 [AudioRecordingPage] Format length:', template.format.length);
+              console.log('🔄 [AudioRecordingPage] Format preview:', template.format.substring(0, 100) + '...');
+              
+              // Apply this format to our session notes
+              if (!sessionData.notes || sessionData.notes.trim() === '') {
+                console.log('🔄 [AudioRecordingPage] Updating session with template content from async load');
+                sessionData.notes = template.format;
+                setSessionNotes({
+                  data: template.format,
+                  assessment: '',
+                  plan: ''
+                });
+                
+                // Also update the session in the service
+                if (typeof sessionData === 'object' && sessionData.id) {
+                  SessionService.updateSession(sessionData.id, { notes: template.format });
+                }
+              }
+            } else {
+              console.log('🔄 [AudioRecordingPage] Phase 3 FAILED - Async load returned empty template');
+            }
+          }).catch(err => {
+            console.error('🔄 [AudioRecordingPage] Phase 3 ERROR:', err);
+          });
+        }
+      }
+
+      // Check if there's stored metadata in the notes
+      const metadataMatch = sessionData.notes?.match(/<!-- SESSION_METADATA: (.*?) -->/);
+      
+      if (metadataMatch && metadataMatch[1]) {
+        try {
+          metadata = JSON.parse(metadataMatch[1]);
+          console.log('Found session metadata:', metadata);
+          
+          // Restore session state from metadata
+          if (metadata.recordingTime !== undefined) {
+            setRecordingTime(metadata.recordingTime);
+          }
+          
+          if (metadata.isRecording !== undefined) {
+            setIsRecording(metadata.isRecording);
+          }
+          
+          if (metadata.activeTab) {
+            setActiveTab(metadata.activeTab);
+          }
+          
+          // Restore email data if available
+          if (metadata.emailData) {
+            if (metadata.emailData.recipients && Array.isArray(metadata.emailData.recipients)) {
+              setEmailRecipients(metadata.emailData.recipients);
+            }
+            
+            if (metadata.emailData.subject) {
+              setEmailSubject(metadata.emailData.subject);
+            }
+            
+            if (metadata.emailData.body) {
+              setEmailBody(metadata.emailData.body);
+            }
+          }
+          
+          // Check for template info in metadata
+          if (metadata.templateId) {
+            setTemplateId(metadata.templateId);
+            setIsCustomTemplate(metadata.isCustomTemplate || false);
+          }
+        } catch (error) {
+          console.error('Error parsing session metadata:', error);
+        }
+      }
+      
+      // Load session notes if available - clean notes from metadata
+      console.log('🔄 [AudioRecordingPage] Processing session notes, available:', !!sessionData.notes);
+      if (sessionData.notes) {
+        console.log('🔄 [AudioRecordingPage] Notes length:', sessionData.notes.length);
+      }
+      
+      let cleanNotes = sessionData.notes;
+      if (metadataMatch) {
+        console.log('🔄 [AudioRecordingPage] Found metadata in notes, cleaning');
+        cleanNotes = sessionData.notes.replace(/\n\n<!-- SESSION_METADATA: .*? -->/, '');
+      }
+      
+      // EMERGENCY DIRECT TEMPLATE ACCESS - if we still have no notes but have a template ID
+      // Check for template in either field
+      const emergencyHasTemplateId = sessionData.templateId && sessionData.templateId.startsWith('template_');
+      const emergencyHasTemplateInSessionType = sessionData.sessionType && sessionData.sessionType.startsWith('template_');
+      
+      if ((!cleanNotes || cleanNotes.trim() === '') && 
+          (emergencyHasTemplateId || emergencyHasTemplateInSessionType)) {
+        console.log('🔄 [AudioRecordingPage] EMERGENCY: Session still has no notes, trying direct template access');
+        
+        // Get template ID from whichever field has it
+        const emergencyTemplateSource = emergencyHasTemplateId ? sessionData.templateId : sessionData.sessionType;
+        const templateId = emergencyTemplateSource.replace('template_', '');
+        console.log('🔄 [AudioRecordingPage] EMERGENCY: Using template source:', emergencyHasTemplateId ? 'templateId' : 'sessionType');
+        
+        try {
+          const dbStr = localStorage.getItem('database.db');
+          if (dbStr) {
+            const dbData = JSON.parse(dbStr);
+            console.log('🔄 [AudioRecordingPage] EMERGENCY: database.db parsed');
+            
+            if (dbData && dbData.templates) {
+              console.log('🔄 [AudioRecordingPage] EMERGENCY: Found templates:', dbData.templates.length);
+              console.log('🔄 [AudioRecordingPage] EMERGENCY: Template IDs:', dbData.templates.map(t => t.id).join(', '));
+              
+              // Try to find the template - try with both raw ID and prefixed ID
+              let template = dbData.templates.find(t => t.id === templateId);
+              
+              // If not found with raw ID, try with the prefixed ID
+              if (!template) {
+                const prefixedId = 'template_' + templateId;
+                template = dbData.templates.find(t => t.id === prefixedId);
+                console.log('🔄 [AudioRecordingPage] EMERGENCY: Trying with prefixed ID:', prefixedId);
+              }
+              
+              // Last attempt - try matching ID substring
+              if (!template) {
+                console.log('🔄 [AudioRecordingPage] EMERGENCY: Trying substring match as last resort');
+                template = dbData.templates.find(t => t.id.includes(templateId));
+              }
+
+              if (template && template.format) {
+                console.log('🔄 [AudioRecordingPage] EMERGENCY: Found template!', template.id);
+                console.log('🔄 [AudioRecordingPage] EMERGENCY: Content:', template.format.substring(0, 50));
+                cleanNotes = template.format;
+                
+                // Also save it back to the session
+                SessionService.updateSession(sessionData.id, { notes: template.format });
+              } else {
+                console.log('🔄 [AudioRecordingPage] EMERGENCY: Template not found after all attempts');
+                
+                // Create an emergency empty template as last resort
+                cleanNotes = `SESSION NOTES\nDate: ${new Date().toLocaleDateString()}\nTime: ${new Date().toLocaleTimeString()}\n\n`;
+                SessionService.updateSession(sessionData.id, { notes: cleanNotes });
+              }
+            }
+          }
+        } catch (e) {
+          console.error('🔄 [AudioRecordingPage] EMERGENCY template access error:', e);
+        }
+      }
+      
+      if (cleanNotes) {
+        // For custom templates
+        if (isCustomTemplate) {
+          try {
+            // Try to extract JSON data from the notes if it exists
+            const jsonMatch = cleanNotes.match(/SESSION CONTENT:\n(.*)/);
+            if (jsonMatch && jsonMatch[1]) {
+              try {
+                const formValues = JSON.parse(jsonMatch[1]);
+                setSessionNotes({
+                  data: jsonMatch[1],
+                  formValues: formValues,
+                  assessment: '',
+                  plan: ''
+                });
+              } catch (e) {
+                console.error('Error parsing JSON from notes:', e);
+                setSessionNotes({
+                  data: cleanNotes,
+                  assessment: '',
+                  plan: ''
+                });
+              }
+            } else {
+              setSessionNotes({
+                data: cleanNotes,
+                assessment: '',
+                plan: ''
+              });
+            }
+          } catch (error) {
+            console.error('Error loading custom template data:', error);
+            setSessionNotes({
+              data: cleanNotes,
+              assessment: '',
+              plan: ''
+            });
+          }
+        }
+        // For DAP format
+        else if (sessionType === 'dap') {
+          const dapSections = cleanNotes.split(/\n\n(?:DATA|ASSESSMENT|PLAN):\n/i);
+          if (dapSections.length >= 3) {
+            setSessionNotes({
+              data: dapSections[1] || '',
+              assessment: dapSections[2] || '',
+              plan: dapSections[3] || ''
+            });
+          } else {
+            setSessionNotes({
+              data: cleanNotes,
+              assessment: '',
+              plan: ''
+            });
+          }
+        } 
+        // For SOAP format
+        else if (sessionType === 'soap') {
+          const soapSections = cleanNotes.split(/\n\n(?:SUBJECTIVE|OBJECTIVE|ASSESSMENT|PLAN):\n/i);
+          if (soapSections.length >= 4) {
+            setSessionNotes({
+              data: soapSections[1] || '',
+              assessment: soapSections[3] || '',
+              plan: soapSections[4] || ''
+            });
+          } else {
+            setSessionNotes({
+              data: cleanNotes,
+              assessment: '',
+              plan: ''
+            });
+          }
+        } 
+        // For other formats
+        else {
+          setSessionNotes({
+            data: cleanNotes,
+            assessment: '',
+            plan: ''
+          });
+        }
+      }
+    }
+    
+    // Set initial random audio levels before we even start recording
+    const initialLevels = Array(20).fill(0).map(() => Math.max(5, Math.min(100, Math.random() * 60)));
+    setAudioLevels(initialLevels);
+    
+    // Start recording and timer
+    startRecording();
+    
+    // Only start timer if not paused in previous state
+    if (!sessionData || (metadata?.isRecording !== false && sessionData.isRecording !== false)) {
+      startTimer();
+    }
+    
+    // Set up interval to auto-save session state every 10 seconds
+    // We're using a longer autosave interval but added throttling in the saveSessionState function
+    autoSaveIntervalRef.current = setInterval(() => {
+      saveSessionState();
+    }, 10000); // 10 seconds
+    
+    return () => {
+      // Save session state before unmounting
+      saveSessionState();
+      stopRecording();
+      clearInterval(timerRef.current);
+      clearInterval(autoSaveIntervalRef.current);
+      clearInterval(generationTimerRef.current);
+    };
+  }, []);
+  
+  // Update the audio visualization
+  useEffect(() => {
+    let animationFrameId;
+    
+    const updateVisualization = () => {
+      try {
+        if (analyserRef.current && dataArrayRef.current) {
+          // Safely get frequency data - make sure dataArrayRef is initialized
+          analyserRef.current.getByteFrequencyData(dataArrayRef.current);
+          
+          // Calculate audio levels for visualization
+          const levels = [];
+          const bufferLength = analyserRef.current ? analyserRef.current.frequencyBinCount : 0;
+          const step = Math.floor(bufferLength / 20) || 1; // Ensure step is at least 1
+          
+          for (let i = 0; i < 20; i++) {
+            let sum = 0;
+            for (let j = 0; j < step; j++) {
+              // Safety check for array bounds
+              const index = i * step + j;
+              if (dataArrayRef.current && index < dataArrayRef.current.length) {
+                sum += dataArrayRef.current[index];
+              }
+            }
+            const average = sum / step;
+            // When paused, still show some minimal activity
+            const height = isRecording 
+              ? Math.max(5, Math.min(100, average * 0.5)) 
+              : Math.max(5, Math.min(30, Math.random() * 20 + 5));
+            levels.push(height);
+          }
+          
+          setAudioLevels(levels);
+        } else {
+          // If analyser or data array not available, just provide random levels
+          const randomLevels = Array(20).fill(0).map(() => 
+            Math.max(5, Math.min(30, Math.random() * 20 + 5))
+          );
+          setAudioLevels(randomLevels);
+        }
+      } catch (error) {
+        console.error('Error updating audio visualization:', error);
+        // Generate random audio levels on error
+        const randomLevels = Array(20).fill(0).map(() => 
+          Math.max(5, Math.min(30, Math.random() * 20 + 5))
+        );
+        setAudioLevels(randomLevels);
+      }
+      
+      // Schedule next frame
+      animationFrameId = requestAnimationFrame(updateVisualization);
+    };
+    
+    // Start animation
+    animationFrameId = requestAnimationFrame(updateVisualization);
+    
+    // Cleanup - cancel animation frame
+    return () => {
+      if (animationFrameId) {
+        cancelAnimationFrame(animationFrameId);
+      }
+    };
+  }, [isRecording]); // Add isRecording as dependency to update on recording state change
+
+  // Setup timer for recording
+  const startTimer = () => {
+    timerRef.current = setInterval(() => {
+      setRecordingTime(prev => {
+        const newTime = prev + 1;
+        // Every 60 seconds, send audio data
+        if (newTime % 60 === 0) {
+          sendAudioChunk();
+        }
+        return newTime;
+      });
+    }, 1000);
+  };
+  
+  // Format the recording time as mm:ss
+  const formatTime = (seconds) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  };
+  
+  // Helper function to extract medical keywords from content
+  const extractKeywords = (content) => {
+    if (!content) return [];
+    
+    const keywords = [];
+    const lowercaseContent = content.toLowerCase();
+    
+    // Check for common medical conditions and keywords
+    const conditionKeywords = {
+      ptsd: ['ptsd', 'trauma', 'flashback', 'nightmare', 'hypervigilance'],
+      anxiety: ['anxiety', 'anxious', 'worry', 'stress', 'nervous', 'panic'],
+      depression: ['depression', 'depressed', 'mood', 'sadness', 'unmotivated'],
+      medication: ['medication', 'medicine', 'prescription', 'dosage', 'drug'],
+      intake: ['intake', 'initial assessment', 'first visit', 'new patient'],
+      therapy: ['therapy', 'therapeutic', 'treatment', 'intervention'],
+      addiction: ['addiction', 'substance', 'alcohol', 'drug', 'recovery', 'sobriety'],
+      bipolar: ['bipolar', 'mania', 'manic', 'mood swings'],
+      sleep: ['insomnia', 'sleep', 'nightmares', 'rest', 'fatigue'],
+      anger: ['anger', 'angry', 'aggression', 'irritable', 'outburst'],
+      grief: ['grief', 'loss', 'bereavement', 'death', 'mourning']
+    };
+    
+    // Check for each condition
+    Object.entries(conditionKeywords).forEach(([condition, terms]) => {
+      if (terms.some(term => lowercaseContent.includes(term))) {
+        keywords.push(condition);
+      }
+    });
+    
+    return keywords;
+  };
+
+  // Helper function that strips SOAP/DAP structure and extracts first line
+  const stripTemplateStructure = (content) => {
+    if (!content) return '';
+    
+    // Remove metadata markers and structure
+    content = content.replace(/<!-- NOTE_METADATA: .*? -->/, '');
+    content = content.replace(/<!-- SESSION_METADATA: .*? -->/, '');
+    
+    // Strip SOAP structure
+    if (content.includes('SUBJECTIVE:')) {
+      // Extract just subjective section
+      const subjMatch = content.match(/SUBJECTIVE:\s*\n(.*?)(?:\n\nOBJECTIVE:|\n\n|$)/s);
+      if (subjMatch && subjMatch[1]) {
+        content = subjMatch[1].trim();
+      }
+    }
+    
+    // Strip DAP structure
+    if (content.includes('DATA:')) {
+      // Extract just data section
+      const dataMatch = content.match(/DATA:\s*\n(.*?)(?:\n\nASSESSMENT:|\n\n|$)/s);
+      if (dataMatch && dataMatch[1]) {
+        content = dataMatch[1].trim();
+      }
+    }
+    
+    // Strip SESSION CONTENT structure
+    if (content.includes('SESSION CONTENT:')) {
+      const contentMatch = content.match(/SESSION CONTENT:\s*\n(.*?)(?:\n\n|$)/s);
+      if (contentMatch && contentMatch[1]) {
+        content = contentMatch[1].trim();
+      }
+    }
+    
+    // Get just first line for display
+    const firstLine = content.split('\n')[0];
+    
+    // Limit length
+    return firstLine.length > 40 ? firstLine.substring(0, 40) + '...' : firstLine;
+  };
+  
+  // Create a concise summary based on metadata or content
+  const cleanNoteContent = (content, sessionData) => {
+    // If there's no content or it's the placeholder text, return empty string
+    if (!content || content.trim() === '' || content.includes("chickens like chickens")) {
+      return '';
+    }
+    
+    // Get patient name (first name only)
+    const patientName = (patient?.name || 'Patient').split(' ')[0];
+    
+    // First check if we have a custom phrase in metadata
+    if (sessionData) {
+      // Check metadata for the custom phrase
+      const metadataMatch = sessionData.notes?.match(/<!-- SESSION_METADATA: (.*?) -->/);
+      if (metadataMatch && metadataMatch[1]) {
+        try {
+          const metadata = JSON.parse(metadataMatch[1]);
+          if (metadata.customPhrase) {
+            // Return the AI-generated topic
+            return metadata.customPhrase;
+          }
+        } catch (error) {
+          console.error('Error parsing session metadata for summary:', error);
+        }
+      }
+      
+      // Check if the session has a title
+      if (sessionData.title && sessionData.title !== '') {
+        return sessionData.title;
+      }
+    }
+    
+    // No custom phrase in metadata, use defaults
+    if (sessionData && sessionData.status === 'completed') {
+      return `Session about ${sessionData.sessionType}`;
+    } else if (sessionData && sessionData.status === 'in-progress') {
+      return `In-progress with ${patientName}`;
+    } else {
+      // Default fallback
+      return `Session with ${patientName}`;
+    }
+  };
+
+  // Start audio recording with enhanced visualization
+  const startRecording = async () => {
+    try {
+      // Initialize audio context
+      audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
+      analyserRef.current = audioContextRef.current.createAnalyser();
+      analyserRef.current.fftSize = 256;
+      
+      // Get microphone access with more options for better quality
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        } 
+      });
+      micStreamRef.current = stream;
+      
+      // Connect the microphone to the analyser
+      const source = audioContextRef.current.createMediaStreamSource(stream);
+      source.connect(analyserRef.current);
+      
+      // Set up the data array for visualization
+      const bufferLength = analyserRef.current.frequencyBinCount;
+      dataArrayRef.current = new Uint8Array(bufferLength);
+      
+      // No need to start visualization here - it's handled by the effect
+      
+      setIsRecording(true);
+      console.log('Recording started with enhanced visualization');
+    } catch (error) {
+      console.error('Error starting recording:', error);
+      setIsRecording(false);
+      
+      // Fallback to simulated animation if microphone access fails
+      const simulateAudio = () => {
+        const simulatedLevels = Array(20).fill(0).map(() => 
+          Math.max(10, Math.min(80, Math.random() * 50 + 15))
+        );
+        setAudioLevels(simulatedLevels);
+        setTimeout(simulateAudio, 100);
+      };
+      
+      simulateAudio();
+    }
+  };
+  
+  // Simplified toggle recording function
+  const toggleRecording = () => {
+    try {
+      console.error("PAUSE BUTTON CLICKED");
+      
+      if (isRecording) {
+        // Pausing the recording
+        clearInterval(timerRef.current);
+        setIsRecording(false);
+        
+        // Always force display the generic text area
+        setIsCustomTemplate(false);
+        setTemplateId(null);
+        
+        // Don't use placeholder text that could be displayed incorrectly
+        // Update the state without using "chickens like chickens" placeholder
+        // that was causing phantom notes
+        setSessionNotes(prev => ({
+          ...prev,
+          assessment: '',
+          plan: ''
+        }));
+        
+        // Continue animation with lower values during pause
+        const pauseAnimation = () => {
+          const pausedLevels = audioLevels.map(level => Math.max(5, level * 0.5));
+          setAudioLevels(pausedLevels);
+        };
+        pauseAnimation();
+      } else {
+        // Resuming recording
+        console.error("RESUME BUTTON CLICKED");
+        startTimer();
+        setIsRecording(true);
+        
+        // Setup animation
+        if (analyserRef.current) {
+          analyserRef.current.getByteFrequencyData(dataArrayRef.current);
+          const levels = [];
+          const bufferLength = analyserRef.current.frequencyBinCount;
+          const step = Math.floor(bufferLength / 20);
+          
+          for (let i = 0; i < 20; i++) {
+            let sum = 0;
+            for (let j = 0; j < step; j++) {
+              sum += dataArrayRef.current[i * step + j];
+            }
+            const average = sum / step;
+            const height = Math.max(10, Math.min(100, average * 0.8));
+            levels.push(height);
+          }
+          
+          setAudioLevels(levels);
+        }
+      }
+    } catch (error) {
+      console.error("ERROR in toggleRecording:", error);
+      alert("Error toggling recording: " + error.message);
+    }
+  };
+
+  // Stop recording completely
+  const stopRecording = () => {
+    clearInterval(timerRef.current);
+    
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach(track => track.stop());
+    }
+    
+    if (audioContextRef.current) {
+      audioContextRef.current.close();
+    }
+    
+    // Even when recording is stopped, keep animation going for UI consistency
+    // by setting random audio levels
+    const randomLevels = Array(20).fill(0).map(() => 
+      Math.max(5, Math.min(20, Math.random() * 15))
+    );
+    setAudioLevels(randomLevels);
+    
+    setIsRecording(false);
+    console.log('Recording stopped');
+  };
+
+  // Send button handler: on click, generate a note based on simulated audio transcription
+  const sendAudioChunk = async () => {
+    try {
+      // Indicate that we're processing
+      setProcessingAudio(true);
+      
+      // In a real app, you would transcribe actual audio here
+      // For now, we'll simulate transcription with a random conversation
+      
+      // Create a simulated raw transcript based on recording time
+      // This simulates what would come from a speech-to-text service
+      const patientName = (patient?.name || 'Patient').split(' ')[0];
+      const diagnosis = patient.diagnosis || patient.diagnoses?.map(d => d.name).join(', ') || 'anxiety';
+      
+      // Simulated raw audio transcript - this would come from the audio in a real app
+      const rawTranscript = [
+        "So I've been feeling really anxious lately, especially at work.",
+        "I keep having these moments where my heart races and I can't focus on anything.",
+        "Sometimes I feel like I'm going to have a panic attack right in the middle of a meeting.",
+        "My sleep has been terrible too, I keep waking up at 3am and can't get back to sleep.",
+        "I've tried some breathing exercises like you suggested, but I'm not sure if I'm doing them right.",
+        "My family has noticed I'm more irritable lately, which makes me feel guilty.",
+        "I'm worried this is going to affect my job performance if it keeps getting worse."
+      ];
+      
+      // Select a portion of the transcript based on recording time 
+      // (longer recording = more content)
+      const transcriptLines = Math.min(
+        Math.max(1, Math.floor(recordingTime / 10)), 
+        rawTranscript.length
+      );
+      
+      const usedTranscript = rawTranscript.slice(0, transcriptLines).join("\n\n");
+      
+      // Generate a formatted note using the session type
+      let formattedNote = '';
+      let sessionTopic = '';
+      
+      // Use a switch based on session type instead of AI
+      // This gives us reliable output without API calls
+      switch (sessionType) {
+        case 'soap':
+          sessionTopic = "Workplace anxiety";
+          formattedNote = `SUBJECTIVE:
+${patientName} reports feeling increasingly anxious, particularly at work. ${patientName} describes experiencing episodes of tachycardia and difficulty concentrating, expressing concerns about potential panic attacks during meetings. Sleep disturbance is reported with early morning awakening. Patient has attempted breathing exercises with limited success.
+
+OBJECTIVE:
+Patient is well-groomed and appropriately dressed. Vital signs within normal limits. No visible signs of acute distress during the session, though patient appears mildly tense with occasional fidgeting. Speech is clear, coherent, and goal-directed. Mood described as "anxious," with congruent affect. No evidence of psychosis, delusions, or suicidal/homicidal ideation.
+
+ASSESSMENT:
+${patientName} presents with symptoms consistent with Generalized Anxiety Disorder with specific social/workplace anxiety features. Current stressors include work performance concerns and family dynamics. Patient demonstrates good insight into condition and symptoms, but struggles with consistent application of coping strategies.
+
+PLAN:
+1. Continue weekly cognitive-behavioral therapy sessions
+2. Review and refine relaxation techniques with daily practice
+3. Discuss potential benefit of psychiatric consultation for medication evaluation
+4. Implement workplace-specific anxiety management strategies
+5. Assign sleep hygiene protocol with sleep journal for next session`;
+          break;
+          
+        case 'dap':
+          sessionTopic = "Anxiety and sleep issues";
+          formattedNote = `DATA:
+${patientName} reports increasing anxiety symptoms, particularly in workplace settings. Specific concerns include racing heart, concentration difficulties, and fear of having panic attacks during meetings. Sleep disturbance with 3am awakening is reported. Patient has attempted previously recommended breathing exercises with limited success. Family members have commented on patient's increased irritability. Patient expresses worry about job performance being impacted by symptoms.
+
+ASSESSMENT:
+Symptoms are consistent with Generalized Anxiety Disorder with features of performance anxiety. Sleep disturbance appears to be exacerbating daytime anxiety symptoms, creating a negative cycle. Patient shows motivation for treatment but is struggling with consistent application of anxiety management techniques. Social support system is present but relationship strain is evident due to symptom manifestation.
+
+PLAN:
+1. Introduce progressive muscle relaxation technique with in-session practice and daily homework
+2. Provide sleep hygiene education with specific focus on addressing early morning awakening
+3. Assign thought record to identify and challenge catastrophic thinking about workplace performance
+4. Discuss benefits/considerations of potential short-term anxiolytic medication
+5. Schedule follow-up session in one week to assess progress`;
+          break;
+          
+        default:
+          sessionTopic = "Anxiety management";
+          formattedNote = `SESSION NOTES:
+${patientName} presented with increasing anxiety symptoms primarily related to workplace situations. Patient described physiological symptoms including racing heart and concentration difficulties, with specific concerns about experiencing panic attacks during meetings. Sleep disturbance was reported, with early morning awakening at approximately 3am.
+
+Patient has attempted to implement previously recommended breathing techniques with limited effectiveness. Family relationships appear strained due to increased irritability, which patient feels guilty about. There is significant concern about anxiety symptoms negatively affecting job performance.
+
+During today's session, we reviewed and refined relaxation strategies, with emphasis on proper technique and consistent application. We discussed the relationship between sleep disturbance and anxiety symptoms, introducing specific sleep hygiene practices. Cognitive restructuring was initiated to address catastrophic thinking patterns about workplace performance.
+
+For next session: Patient will maintain a daily anxiety log, practice progressive muscle relaxation twice daily, and implement discussed sleep hygiene practices. We will assess effectiveness of these interventions and consider additional approaches as needed.`;
+      }
+      
+      // Set the session topic and formatted note
+      try {
+        // Find the current session
+        const currentSession = SessionService.getSessions().find(s => 
+          s.patientId === patientId && s.status === 'in-progress'
+        );
+        
+        if (currentSession) {
+          // Get existing metadata if any
+          const metadataMatch = currentSession.notes?.match(/<!-- SESSION_METADATA: (.*?) -->/);
+          let metadata = {};
+          
+          if (metadataMatch && metadataMatch[1]) {
+            try {
+              metadata = JSON.parse(metadataMatch[1]);
+            } catch (error) {
+              console.error('Error parsing session metadata:', error);
+              metadata = {};
+            }
+          }
+          
+          // Add the session topic to metadata
+          metadata.customPhrase = sessionTopic;
+          
+          // Update session with metadata and title
+          let updatedNotes = currentSession.notes || '';
+          
+          // Remove existing metadata if any
+          updatedNotes = updatedNotes.replace(/\n\n<!-- SESSION_METADATA: .*? -->/, '');
+          
+          // Add new metadata
+          const metadataStr = JSON.stringify(metadata);
+          updatedNotes += `\n\n<!-- SESSION_METADATA: ${metadataStr} -->`;
+          
+          SessionService.updateSession(currentSession.id, {
+            notes: updatedNotes,
+            title: sessionTopic
+          });
+        }
+      } catch (error) {
+        console.error('Error updating session metadata:', error);
+      }
+      
+      // Update state with the formatted note
+      if (sessionType === 'dap') {
+        const dataMatch = formattedNote.match(/DATA:\s*([\s\S]*?)(?=ASSESSMENT:|$)/i);
+        const assessmentMatch = formattedNote.match(/ASSESSMENT:\s*([\s\S]*?)(?=PLAN:|$)/i);
+        const planMatch = formattedNote.match(/PLAN:\s*([\s\S]*?)(?=$)/i);
+        
+        setSessionNotes({
+          data: dataMatch?.[1]?.trim() || formattedNote,
+          assessment: assessmentMatch?.[1]?.trim() || "",
+          plan: planMatch?.[1]?.trim() || ""
+        });
+      } else if (sessionType === 'soap') {
+        const subjMatch = formattedNote.match(/SUBJECTIVE:\s*([\s\S]*?)(?=OBJECTIVE:|$)/i);
+        const objMatch = formattedNote.match(/OBJECTIVE:\s*([\s\S]*?)(?=ASSESSMENT:|$)/i);
+        const assessmentMatch = formattedNote.match(/ASSESSMENT:\s*([\s\S]*?)(?=PLAN:|$)/i);
+        const planMatch = formattedNote.match(/PLAN:\s*([\s\S]*?)(?=$)/i);
+        
+        // Combine subjective and objective for the data field
+        const combinedData = `SUBJECTIVE:\n${subjMatch?.[1]?.trim() || ''}\n\nOBJECTIVE:\n${objMatch?.[1]?.trim() || ''}`;
+        
+        setSessionNotes({
+          data: combinedData,
+          assessment: assessmentMatch?.[1]?.trim() || "",
+          plan: planMatch?.[1]?.trim() || ""
+        });
+      } else {
+        // Default for other session types
+        setSessionNotes({
+          data: formattedNote,
+          assessment: "",
+          plan: ""
+        });
+      }
+      
+      // Save the session state to persist changes
+      saveSessionState();
+    } catch (error) {
+      console.error('Error in sendAudioChunk:', error);
+      setSessionNotes({
+        data: "Error generating note. Please try again.",
+        assessment: "",
+        plan: ""
+      });
+    } finally {
+      setProcessingAudio(false);
+    }
+  };
+        
+        // Add the session topic to metadata
+        metadata.customPhrase = sessionTopic;
+        
+        // Update session with metadata and title
+        let updatedNotes = currentSession.notes || '';
+        
+        // Remove existing metadata if any
+        updatedNotes = updatedNotes.replace(/\n\n<!-- SESSION_METADATA: .*? -->/, '');
+        
+        // Add new metadata
+        const metadataStr = JSON.stringify(metadata);
+        updatedNotes += `\n\n<!-- SESSION_METADATA: ${metadataStr} -->`;
+        
+        SessionService.updateSession(currentSession.id, {
+          notes: updatedNotes,
+          title: sessionTopic
+        });
+      }
+      
+      // Update the notes with the formatted version
+      if (sessionType === 'dap') {
+        // For DAP notes, try to extract sections
+        const dataMatch = cleanedContent.match(/DATA:\s*([\s\S]*?)(?=ASSESSMENT:|$)/i);
+        const assessmentMatch = cleanedContent.match(/ASSESSMENT:\s*([\s\S]*?)(?=PLAN:|$)/i);
+        const planMatch = cleanedContent.match(/PLAN:\s*([\s\S]*?)(?=$)/i);
+        
+        setSessionNotes({
+          data: dataMatch?.[1]?.trim() || cleanedContent,
+          assessment: assessmentMatch?.[1]?.trim() || "",
+          plan: planMatch?.[1]?.trim() || ""
+        });
+      } else if (sessionType === 'soap') {
+        // For SOAP notes, try to extract sections
+        const subjMatch = cleanedContent.match(/SUBJECTIVE:\s*([\s\S]*?)(?=OBJECTIVE:|$)/i);
+        const objMatch = cleanedContent.match(/OBJECTIVE:\s*([\s\S]*?)(?=ASSESSMENT:|$)/i);
+        const assessmentMatch = cleanedContent.match(/ASSESSMENT:\s*([\s\S]*?)(?=PLAN:|$)/i);
+        const planMatch = cleanedContent.match(/PLAN:\s*([\s\S]*?)(?=$)/i);
+        
+        // Combine subjective and objective for the data field
+        const combinedData = `SUBJECTIVE:\n${subjMatch?.[1]?.trim() || ''}\n\nOBJECTIVE:\n${objMatch?.[1]?.trim() || ''}`;
+        
+        setSessionNotes({
+          data: combinedData,
+          assessment: assessmentMatch?.[1]?.trim() || "",
+          plan: planMatch?.[1]?.trim() || ""
+        });
+      } else {
+        // Default for other session types
+        setSessionNotes({
+          data: cleanedContent,
+          assessment: "",
+          plan: ""
+        });
+      }
+      
+      // Save the updated notes
+      saveSessionState();
+      
+    } catch (error) {
+      console.error('Error processing audio chunk:', error);
+      // Fallback in case of error
+      setSessionNotes({
+        data: "Error generating note from transcript. Please try again.",
+        assessment: "",
+        plan: ""
+      });
+    } finally {
+      setProcessingAudio(false);
+    }
+  };
+  
+  // Generate custom note using AI API
+  const handleGenerateCustomNote = async () => {
+    // Set state to show we're generating a note
+    setIsGeneratingNote(true);
+    setGenerationProgress(0);
+    
+    // API is pre-configured with Claude, no need to check
+
+    try {
+      // Create patient info string
+      const patientInfo = `Name: ${patient.name || 'Patient'}
+DOB: ${patient.dob || 'Unknown'}
+Age: ${patient.age || 'Unknown'}
+Gender: ${patient.gender || 'Unknown'}
+Diagnosis: ${patient.diagnosis || patient.diagnoses?.map(d => d.name).join(', ') || 'Unknown'}
+${patient.icdCode ? `ICD Code: ${patient.icdCode}` : ''}`;
+
+      // Create simulated transcript (in a real app, this would be the actual audio transcript)
+      const diagnosis = patient.diagnosis || patient.diagnoses?.map(d => d.name).join(', ') || 'anxiety';
+      const transcript = `
+Therapist: "Hello ${patient.name || 'there'}, how have you been feeling since our last session?"
+
+Patient: "I've been struggling a bit with my ${diagnosis}. I've been having trouble sleeping, only getting about 4-5 hours per night. I keep waking up with racing thoughts."
+
+Therapist: "Can you tell me more about these racing thoughts?"
+
+Patient: "They're mostly about work and family responsibilities. I feel overwhelmed by everything I need to do. Sometimes my heart races and I feel like I can't catch my breath."
+
+Therapist: "How has this been affecting your daily activities?"
+
+Patient: "It's hard to concentrate at work. I've missed some deadlines, which makes me more anxious. At home, I'm irritable with my family. I've started using the breathing techniques you suggested, and they help sometimes, but not always."
+
+Therapist: "What about the medication we discussed last time?"
+
+Patient: "I've been taking it regularly for two weeks now. I think it's helping a little bit, but I still have periods where the anxiety feels overwhelming, especially in the mornings."
+
+Therapist: "Are you experiencing any physical symptoms besides the sleep issues and heart racing?"
+
+Patient: "Yes, I get tension headaches almost daily now, and my muscles feel tight, especially in my shoulders and neck. Sometimes I feel dizzy too."
+
+Therapist: "Have you been able to implement any of the self-care activities we talked about?"
+
+Patient: "I tried the daily walking, and managed about three days last week. It did help when I did it. The journaling has been harder to stick with, but I did download that meditation app you recommended."
+`;
+
+      // Prepare template data if using a custom template
+      let templateData = null;
+      if (isCustomTemplate && templateId) {
+        const template = await TemplateService.getTemplate(templateId.replace('template_', ''));
+        if (template) {
+          templateData = {
+            structure: template.format,
+            fields: template.fields || []
+          };
+        }
+      }
+
+      // Generate note using Claude API
+      const generatedNote = await AIService.generateNote(
+        {
+          patientInfo,
+          sessionType,
+          transcript,
+          templateData
+        },
+        (progress) => setGenerationProgress(progress)
+      );
+
+      // Set the session note content to our AI-generated note
+      setSessionNotes({
+        data: generatedNote,
+        assessment: '',
+        plan: ''
+      });
+      
+      // Save the note to the session
+      saveSessionState();
+      
+    } catch (error) {
+      console.error('Error generating note:', error);
+      alert(`Error generating note: ${error.message}`);
+    } finally {
+      setIsGeneratingNote(false);
+    }
+  };
+
+  // Handle finishing the note
+  const handleFinishNote = () => {
+    // Update the session in the service
+    const sessionId = SessionService.getSessions().find(s => 
+      s.patientId === patientId && s.status === 'in-progress'
+    )?.id;
+    
+    if (sessionId) {
+      // Combine all notes sections based on session type
+      let combinedNotes = '';
+      
+      // Add custom metadata to help with preview display - this metadata 
+      // will be extracted by the cleanNoteContent function
+      const metaPrefix = `<!-- NOTE_METADATA: ${JSON.stringify({
+        patientName: patient?.name || 'Patient',
+        noteType: sessionType,
+        keywords: extractKeywords(sessionNotes.data),
+        customPhrase: `First visit with ${patient?.name?.split(' ')[0] || 'Patient'}, discussed PTSD`
+      })} -->\n\n`;
+      
+      if (sessionType === 'dap') {
+        combinedNotes = metaPrefix + `DATA:\\n${sessionNotes.data}\\n\\nASSESSMENT:\\n${sessionNotes.assessment}\\n\\nPLAN:\\n${sessionNotes.plan}`;
+      } else if (sessionType === 'soap') {
+        combinedNotes = metaPrefix + `SUBJECTIVE:\\n${sessionNotes.data}\\n\\nOBJECTIVE:\\n\\n\\nASSESSMENT:\\n${sessionNotes.assessment}\\n\\nPLAN:\\n${sessionNotes.plan}`;
+      } else if (isCustomTemplate && templateId) {
+        // For custom templates, store the form values as JSON
+        const dataToStore = sessionNotes.formValues ? JSON.stringify(sessionNotes.formValues) : sessionNotes.data;
+        combinedNotes = metaPrefix + `SESSION CONTENT:\\n${dataToStore}`;
+      } else {
+        combinedNotes = metaPrefix + `SESSION CONTENT:\\n${sessionNotes.data}`;
+      }
+      
+      // Stop auto-saving when finishing the note
+      if (autoSaveIntervalRef.current) {
+        clearInterval(autoSaveIntervalRef.current);
+      }
+      
+      // Add template info metadata to the note before finalizing
+      if (isCustomTemplate && templateId) {
+        const templateInfo = {
+          templateId,
+          isCustomTemplate: true,
+          finishedAt: new Date().toISOString()
+        };
+        
+        // Add this information at the end of the note in a comment format
+        combinedNotes += `\\n\\n<!-- TEMPLATE_INFO: ${JSON.stringify(templateInfo)} -->`;
+      }
+      
+      // Save one final time without session metadata to finalize the note
+      SessionService.endLiveSession(sessionId, combinedNotes);
+    }
+    
+    // Navigate back to home
+    window.location.hash = '/';
+  };
+  
+  // Email handling functions
+  const handleAddEmailRecipient = (e) => {
+    e.preventDefault();
+    
+    // Handle multiple emails separated by commas or semicolons
+    const emailsToAdd = emailInput.split(/[,;]/).map(email => email.trim()).filter(email => email);
+    
+    // Basic email validation
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    
+    // Filter valid emails
+    const validEmails = emailsToAdd.filter(email => emailRegex.test(email));
+    
+    // Add valid emails to the list if they don't already exist
+    if (validEmails.length > 0) {
+      const newRecipients = [...emailRecipients];
+      
+      validEmails.forEach(email => {
+        if (!newRecipients.includes(email)) {
+          newRecipients.push(email);
+        }
+      });
+      
+      setEmailRecipients(newRecipients);
+      setEmailInput('');
+    } else if (emailInput && !emailRegex.test(emailInput)) {
+      // Show error if email is invalid
+      alert('Please enter a valid email address');
+    }
+  };
+
+  const handleRemoveEmailRecipient = (email) => {
+    setEmailRecipients(emailRecipients.filter(e => e !== email));
+  };
+
+  const handleEmailKeyDown = (e) => {
+    if (e.key === 'Enter' || e.key === ',') {
+      e.preventDefault();
+      handleAddEmailRecipient(e);
+    } else if (e.key === 'Backspace' && emailInput === '' && emailRecipients.length > 0) {
+      // Remove the last recipient when backspace is pressed with empty input
+      const newRecipients = [...emailRecipients];
+      newRecipients.pop();
+      setEmailRecipients(newRecipients);
+    }
+  };
+
+  // Initialize email content when tab changes
+  useEffect(() => {
+    if (activeTab === 'email' && !emailSubject && !emailBody) {
+      setEmailSubject(`Session summary for ${patient.name}`);
+      setEmailBody(`Hello,\n\nI'm sending a summary of today's session with ${patient.name}.\n\nKey points discussed:\n- \n- \n- \n\nNext steps:\n- \n\nBest regards,\nTherapist Name`);
+    }
+  }, [activeTab, patient.name, emailSubject, emailBody]);
+
+  // State for success popup
+  const [showSuccessPopup, setShowSuccessPopup] = useState(false);
+  
+  // The API is pre-configured with OpenAI in the AIService
+  const [isApiReady, setIsApiReady] = useState(true);
+  
+  // Log API configuration on load for debugging
+  useEffect(() => {
+    console.log('AI Service using OpenAI API');
+    console.log('Model:', AIService.config.model);
+  }, []);
+  
+  // Handle sending email
+  const handleSendEmail = () => {
+    if (emailRecipients.length === 0) {
+      alert('Please add at least one recipient email address');
+      return;
+    }
+
+    setEmailStatus('sending');
+    
+    // Simulate sending email
+    setTimeout(() => {
+      // In a real implementation, this would make an API call
+      console.log('Sending email to:', emailRecipients);
+      console.log('Subject:', emailSubject);
+      console.log('Body:', emailBody);
+      
+      setEmailStatus('sent');
+      setShowSuccessPopup(true);
+      
+      // Reset form after 3 seconds and hide success popup
+      setTimeout(() => {
+        setEmailStatus(null);
+        setShowSuccessPopup(false);
+      }, 5000);
+    }, 2000);
+  };
+  
+  // Handle saving draft
+  const handleSaveDraft = () => {
+    // In a real implementation, this would store the draft in a database or localStorage
+    console.log('Saving draft:', {
+      recipients: emailRecipients,
+      subject: emailSubject,
+      body: emailBody
+    });
+    
+    setEmailStatus('draft-saved');
+    
+    // Clear status after 3 seconds
+    setTimeout(() => {
+      setEmailStatus(null);
+    }, 3000);
+  };
+
+  // Safety check - if patient doesn't exist, show error
+  if (!patient || !patient.id) {
+    return (
+      <div className="flex flex-col items-center justify-center h-screen bg-gray-50 p-6">
+        <div className="bg-red-100 text-red-700 p-4 rounded-lg mb-4 max-w-md">
+          <h3 className="font-bold mb-2">Patient Not Found</h3>
+          <p>The patient information for this session could not be found.</p>
+          <p className="text-sm mt-2">Patient ID: {patientId}</p>
+        </div>
+        <a 
+          href="#/new-session" 
+          className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 no-underline"
+        >
+          Return to Session Setup
+        </a>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex h-screen bg-gray-50">
+      {/* Left sidebar - Recording controls */}
+      <div className="w-72 bg-white border-r border-gray-200 flex flex-col">
+        <div className="p-4 border-b border-gray-200">
+          <a 
+            href="#/new-session"
+            className="flex items-center text-gray-600 no-underline" 
+          >
+            <ChevronLeft className="w-5 h-5 mr-1" />
+            Back to session setup
+          </a>
+        </div>
+        
+        {/* Recording display */}
+        <div className="flex-1 p-4 flex flex-col items-center">
+          <div className="bg-gray-100 p-4 rounded-xl w-full mb-4">
+            <h3 className="font-medium text-gray-800 mb-2">Captured Session</h3>
+            
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center text-sm text-gray-600">
+                <Clock className="w-4 h-4 mr-1" />
+                <span>{formatTime(recordingTime)}</span>
+              </div>
+              <div className={`px-2 py-1 rounded-full text-xs font-medium ${
+                isRecording 
+                  ? 'bg-red-100 text-red-800' 
+                  : 'bg-yellow-100 text-yellow-800'
+              }`}>
+                {isRecording ? 'Recording' : 'Paused'}
+              </div>
+            </div>
+            
+            {/* Audio visualization */}
+            <div 
+              className="h-24 bg-white rounded-lg flex items-end justify-center space-x-1.5 p-3 mb-4"
+              style={{
+                background: isRecording ? 'linear-gradient(to bottom, rgba(254, 226, 226, 0.3), white)' : 'white',
+                boxShadow: 'inset 0 1px 1px rgba(0,0,0,0.05)',
+                border: '1px solid #f0f0f0'
+              }}
+            >
+              {audioLevels.map((height, idx) => (
+                <div
+                  key={idx}
+                  className={`rounded-full transform ${
+                    isRecording 
+                      ? idx % 2 === 0 ? 'bg-red-500' : 'bg-red-400'
+                      : idx % 2 === 0 ? 'bg-gray-400' : 'bg-gray-300'
+                  }`}
+                  style={{ 
+                    height: `${height}%`,
+                    width: '3px',
+                    transition: 'height 0.1s ease, opacity 0.2s ease',
+                    opacity: isRecording ? 1 : 0.7,
+                    animation: isRecording ? `pulse ${(idx % 3) + 1}s infinite alternate` : 'none'
+                  }}
+                ></div>
+              ))}
+            </div>
+            
+            <style dangerouslySetInnerHTML={{
+              __html: `
+                @keyframes pulse {
+                  0% {
+                    transform: scaleY(0.98);
+                  }
+                  100% {
+                    transform: scaleY(1.02);
+                  }
+                }
+              `
+            }} />
+            
+            {/* Recording controls */}
+            <div className="flex justify-center space-x-4">
+              <button
+                onClick={toggleRecording}
+                className={`p-3 rounded-full focus:outline-none focus:ring-2 focus:ring-offset-2 transition-all duration-200 ${
+                  isRecording 
+                    ? 'bg-[#92C7CF] text-white hover:bg-[#82b7bf] focus:ring-[#92C7CF] border border-[#82b7bf]' 
+                    : 'bg-[#92C7CF] text-white hover:bg-[#82b7bf] focus:ring-[#92C7CF] border border-[#82b7bf]'
+                }`}
+                style={{
+                  boxShadow: '0 1px 2px rgba(0, 0, 0, 0.05)'
+                }}
+              >
+                {isRecording ? (
+                  <Pause className="w-6 h-6" />
+                ) : (
+                  <Play className="w-6 h-6" />
+                )}
+              </button>
+              <button
+                onClick={sendAudioChunk}
+                disabled={processingAudio}
+                className={`p-3 rounded-full focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[#92C7CF] transition-all duration-200 ${
+                  processingAudio 
+                    ? 'bg-gray-100 cursor-not-allowed border border-gray-200' 
+                    : 'bg-[#92C7CF] hover:bg-[#82b7bf] border border-[#82b7bf]'
+                }`}
+                style={{
+                  boxShadow: processingAudio ? 'none' : '0 1px 2px rgba(0, 0, 0, 0.1)'
+                }}
+              >
+                {processingAudio ? (
+                  <div className="w-6 h-6 flex items-center justify-center">
+                    <div className="w-4 h-4 border-2 border-gray-300 border-t-[#92C7CF] rounded-full animate-spin"></div>
+                  </div>
+                ) : (
+                  <Send className="w-6 h-6 text-white" />
+                )}
+              </button>
+            </div>
+          </div>
+          
+          {/* Past notes for this patient */}
+          <div className="w-full">
+            <h3 className="font-medium text-gray-800 mb-2">Past Notes for {patient.name}</h3>
+            <div className="space-y-2 overflow-y-auto max-h-96">
+              {patientSessions
+                // Only show sessions that have actual content in their notes
+                .filter(session => 
+                  (session.status === 'completed' || session.status === 'in-progress') && 
+                  session.notes && 
+                  session.notes.trim() !== '' &&
+                  !session.notes.includes("chickens like chickens")
+                )
+                .map(session => (
+                <div 
+                  key={session.id} 
+                  className={`p-3 bg-white border rounded-lg hover:shadow-sm cursor-pointer transition-all duration-200 hover:border-[#92C7CF] ${
+                    session.status === 'in-progress' ? 'border-orange-300' : 'border-gray-200'
+                  }`}
+                  onClick={() => {
+                    if (session.status === 'in-progress') {
+                      // If clicking on an in-progress session, don't use the modal
+                      // Instead open it directly in the current editor
+                      window.location.hash = `/recording/${patientId}/${session.sessionType}/${session.id}`;
+                    } else {
+                      setViewingNoteId(session.id);
+                    }
+                  }}
+                >
+                  <div className="flex justify-between items-start">
+                    <div className="flex items-start">
+                      {/* Avatar Circle */}
+                      <div 
+                        className={`flex items-center justify-center w-8 h-8 rounded-full mr-2 text-white text-xs font-medium 
+                          ${session.status === 'in-progress' ? 'bg-green-600' : 'bg-[#92C7CF]'}`}
+                        style={{ aspectRatio: '1/1' }}
+                      >
+                        {session.sessionType.charAt(0).toUpperCase()}
+                      </div>
+                      
+                      <div>
+                        <h4 className="font-medium text-sm">
+                          {session.sessionType.charAt(0).toUpperCase() + session.sessionType.slice(1)} Note
+                        </h4>
+                        <p className="text-xs text-gray-500">{session.date}</p>
+                      </div>
+                    </div>
+                    
+                    {/* Action Buttons */}
+                    <div className="flex space-x-1">
+                      {session.status === 'in-progress' ? (
+                        <>
+                          {/* Resume button - only show this one for in-progress sessions */}
+                          <button 
+                            className="p-1.5 rounded-full bg-green-50 text-green-600 hover:bg-green-100"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              // Update session metadata to set isRecording to true before resuming
+                              const sessionObj = SessionService.getSession(session.id);
+                              if (sessionObj && sessionObj.notes) {
+                                const metadataMatch = sessionObj.notes.match(/<!-- SESSION_METADATA: (.*?) -->/);
+                                if (metadataMatch && metadataMatch[1]) {
+                                  try {
+                                    const metadata = JSON.parse(metadataMatch[1]);
+                                    metadata.isRecording = true;
+                                    
+                                    // Update the session with the modified metadata
+                                    const metadataStr = JSON.stringify(metadata);
+                                    const updatedNotes = sessionObj.notes.replace(
+                                      /<!-- SESSION_METADATA: .*? -->/,
+                                      `<!-- SESSION_METADATA: ${metadataStr} -->`
+                                    );
+                                    
+                                    SessionService.updateSession(session.id, { notes: updatedNotes });
+                                  } catch (error) {
+                                    console.error('Error updating session metadata:', error);
+                                  }
+                                }
+                              }
+                              // Save the session to localStorage to resume it properly
+                              localStorage.setItem(
+                                'activeSession',
+                                JSON.stringify({
+                                  patientId: session.patientId,
+                                  sessionType: session.sessionType,
+                                  sessionId: session.id
+                                })
+                              );
+                              window.location.hash = `/recording/${patientId}/${session.sessionType}/${session.id}`;
+                            }}
+                            title="Resume Session"
+                            style={{
+                              border: 'none',
+                              boxShadow: 'none'
+                            }}
+                          >
+                            <svg xmlns="http://www.w3.org/2000/svg" className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor">
+                              <path d="M8 5v14l11-7z" />
+                            </svg>
+                          </button>
+                        </>
+                      ) : (
+                        // Trash icon for completed notes
+                        <button 
+                          className="p-1.5 rounded-full bg-red-50 text-red-600 hover:bg-red-100"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            // Mark the session as 'hidden' rather than deleting it
+                            SessionService.updateSession(session.id, { status: 'hidden' });
+                          }}
+                          title="Remove from View"
+                          style={{
+                            border: 'none',
+                            boxShadow: 'none'
+                          }}
+                        >
+                          <svg xmlns="http://www.w3.org/2000/svg" className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  
+                  {/* Preview of note content - deliberately using fixed summaries */}
+                  {session.notes && (
+                    <div className="mt-2 text-xs text-gray-600 line-clamp-2 font-medium">
+                      {cleanNoteContent(session.notes, session)}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+          
+          {/* Note Viewer Modal */}
+          <NoteViewerModal 
+            isOpen={viewingNoteId !== null}
+            onClose={() => setViewingNoteId(null)}
+            sessionId={viewingNoteId}
+          />
+          
+          {/* API Configuration Modal removed - using Claude API by default */}
+        </div>
+      </div>
+      
+      {/* Main content - Session notes */}
+      <div className="flex-1 flex flex-col">
+        {/* Header */}
+        <header className="bg-white border-b border-gray-200 p-4">
+          <div className="flex items-center justify-between">
+            <h1 className="text-xl font-bold text-gray-800 tracking-wide">
+              {sessionObj && sessionObj.title ? sessionObj.title : `${patient.name} - ${sessionType.toUpperCase()} Session`}
+            </h1>
+            <div className="flex items-center text-sm text-gray-600">
+              <span>Started: {new Date().toLocaleTimeString()}</span>
+            </div>
+          </div>
+        </header>
+        
+        {/* Content area with tabs */}
+        <div className="flex-1 overflow-hidden flex flex-col">
+          {/* Tabs */}
+          <div className="bg-white border-b border-gray-200 px-4">
+            <div className="flex">
+              <button
+                className={`px-4 py-3 text-sm font-medium focus:outline-none transition-all duration-300 relative ${
+                  activeTab === 'session'
+                    ? 'text-[#92C7CF]'
+                    : 'text-gray-500 hover:text-gray-700'
+                }`}
+                onClick={() => setActiveTab('session')}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  boxShadow: 'none'
+                }}
+              >
+                <div className="flex items-center">
+                  <MessageCircle className={`w-4 h-4 mr-2 ${activeTab === 'session' ? 'text-[#92C7CF]' : 'text-gray-400'}`} />
+                  <span>Session</span>
+                </div>
+                {activeTab === 'session' && (
+                  <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-[#92C7CF] rounded-t"></div>
+                )}
+              </button>
+              <button
+                className={`px-4 py-3 text-sm font-medium focus:outline-none transition-all duration-300 relative ${
+                  activeTab === 'email'
+                    ? 'text-[#92C7CF]'
+                    : 'text-gray-500 hover:text-gray-700'
+                }`}
+                onClick={() => setActiveTab('email')}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  boxShadow: 'none'
+                }}
+              >
+                <div className="flex items-center">
+                  <Mail className={`w-4 h-4 mr-2 ${activeTab === 'email' ? 'text-[#92C7CF]' : 'text-gray-400'}`} />
+                  <span>Email</span>
+                </div>
+                {activeTab === 'email' && (
+                  <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-[#92C7CF] rounded-t"></div>
+                )}
+              </button>
+            </div>
+          </div>
+          
+          {/* Tab content */}
+          <div className="flex-1 overflow-auto">
+            {activeTab === 'session' ? (
+              <div className="p-6">
+                {/* Session content based on type */}
+                {isCustomTemplate && templateId ? (
+                  // Render structured template form for custom templates
+                  <StructuredTemplateForm 
+                    templateId={templateId}
+                    initialValues={sessionNotes}
+                    onChange={(formValues) => {
+                      // Throttle console output and state updates to reduce performance impact
+                      // Only log every 10 characters to reduce spam
+                      const contentLength = formValues.content ? formValues.content.length : 0;
+                      if (contentLength % 10 === 0) {
+                        console.log("🔄 [AudioRecordingPage] Form updated, content length:", contentLength);
+                      }
+                      
+                      // Convert form values to session notes format
+                      const updatedNotes = {
+                        data: JSON.stringify(formValues),
+                        formValues: formValues,
+                        assessment: '',
+                        plan: ''
+                      };
+                      
+                      // Update state
+                      setSessionNotes(updatedNotes);
+                      
+                      // Save the template ID and custom template flag in metadata
+                      const sessionId = SessionService.getSessions().find(s => 
+                        s.patientId === patientId && s.status === 'in-progress'
+                      )?.id;
+                      
+                      if (sessionId) {
+                        // Get existing metadata
+                        const session = SessionService.getSession(sessionId);
+                        const metadataMatch = session?.notes?.match(/<!-- SESSION_METADATA: (.*?) -->/); 
+                        let metadata = {};
+                        
+                        if (metadataMatch && metadataMatch[1]) {
+                          try {
+                            metadata = JSON.parse(metadataMatch[1]);
+                          } catch (error) {
+                            console.error('Error parsing session metadata:', error);
+                          }
+                        }
+                        
+                        // Update metadata with template info
+                        metadata.templateId = templateId;
+                        metadata.isCustomTemplate = true;
+                        
+                        // Save the session with updated metadata
+                        saveSessionState();
+                      }
+                    }}
+                    patient={patient}
+                  />
+                ) : sessionType === 'dap' ? (
+                  <div className="space-y-6">
+                    {/* DATA section */}
+                    <div>
+                      <div className="flex items-center justify-between mb-2">
+                        <h2 className="text-lg font-medium text-gray-800">DATA</h2>
+                        <span className="text-xs text-gray-500">Objective information</span>
+                      </div>
+                      <textarea
+                        className="w-full p-4 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#92C7CF] focus:border-[#92C7CF] shadow-sm"
+                        rows={5}
+                        value={sessionNotes.data}
+                        onChange={(e) => setSessionNotes(prev => ({ ...prev, data: e.target.value }))}
+                        placeholder="Enter objective information about what the client said and did"
+                        style={{
+                          backgroundColor: 'white',
+                          resize: 'vertical',
+                          minHeight: '100px',
+                          transition: 'border-color 0.2s, box-shadow 0.2s'
+                        }}
+                      ></textarea>
+                    </div>
+                    
+                    {/* ASSESSMENT section */}
+                    <div>
+                      <div className="flex items-center justify-between mb-2">
+                        <h2 className="text-lg font-medium text-gray-800">ASSESSMENT</h2>
+                        <span className="text-xs text-gray-500">Clinical interpretation</span>
+                      </div>
+                      <textarea
+                        className="w-full p-4 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#92C7CF] focus:border-[#92C7CF] shadow-sm"
+                        rows={5}
+                        value={sessionNotes.assessment}
+                        onChange={(e) => setSessionNotes(prev => ({ ...prev, assessment: e.target.value }))}
+                        placeholder="Enter your clinical interpretation of the data"
+                        style={{
+                          backgroundColor: 'white',
+                          resize: 'vertical',
+                          minHeight: '100px',
+                          transition: 'border-color 0.2s, box-shadow 0.2s'
+                        }}
+                      ></textarea>
+                    </div>
+                    
+                    {/* PLAN section */}
+                    <div>
+                      <div className="flex items-center justify-between mb-2">
+                        <h2 className="text-lg font-medium text-gray-800">PLAN</h2>
+                        <span className="text-xs text-gray-500">Treatment & next steps</span>
+                      </div>
+                      <textarea
+                        className="w-full p-4 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#92C7CF] focus:border-[#92C7CF] shadow-sm"
+                        rows={5}
+                        value={sessionNotes.plan}
+                        onChange={(e) => setSessionNotes(prev => ({ ...prev, plan: e.target.value }))}
+                        placeholder="Enter the treatment plan and next steps"
+                        style={{
+                          backgroundColor: 'white',
+                          resize: 'vertical',
+                          minHeight: '100px',
+                          transition: 'border-color 0.2s, box-shadow 0.2s'
+                        }}
+                      ></textarea>
+                    </div>
+                  </div>
+                ) : (
+                  // Generic session type
+                  <div>
+                    <div className="flex items-center justify-between mb-3">
+                      <h2 className="text-lg font-medium text-gray-800">
+                        {sessionType.charAt(0).toUpperCase() + sessionType.slice(1)} Notes
+                      </h2>
+                      <span className="text-xs text-gray-500 bg-gray-100 px-2 py-1 rounded-full">
+                        {patient.name} • {new Date().toLocaleDateString()}
+                      </span>
+                    </div>
+                    <div>
+                      <textarea
+                        className="w-full p-4 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#92C7CF] focus:border-[#92C7CF] shadow-sm"
+                        rows={15}
+                        value={sessionNotes.data}
+                        onChange={(e) => {
+                          console.error('DEBUG: Textarea onChange called, new value:', e.target.value);
+                          setSessionNotes(prev => {
+                            console.error('DEBUG: Updating sessionNotes state');
+                            return { ...prev, data: e.target.value };
+                          });
+                        }}
+                        placeholder="Loading content..."
+                        style={{
+                          backgroundColor: 'white',
+                          resize: 'vertical',
+                          minHeight: '200px',
+                          transition: 'border-color 0.2s, box-shadow 0.2s',
+                          lineHeight: '1.5',
+                          fontSize: '16px',
+                          fontWeight: sessionNotes.data === "chickens like chickens" ? 'bold' : 'normal',
+                          color: sessionNotes.data === "chickens like chickens" ? '#2563EB' : 'inherit'
+                        }}
+                        onFocus={() => {
+                          console.error('DEBUG: Textarea focused');
+                        }}
+                      ></textarea>
+                      
+                      {/* Add a clear indicator below when the update happens */}
+                      {sessionNotes.data === "chickens like chickens" && (
+                        <div className="mt-2 p-2 bg-green-100 border border-green-300 text-green-800 rounded">
+                          ✓ Custom note content successfully applied!
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            ) : (
+              // Email tab content
+              <div className="p-6 bg-gray-50 min-h-full">
+                <div className="max-w-3xl mx-auto bg-white rounded-lg shadow-sm border border-gray-100 p-6">
+                  <h2 className="text-lg font-medium text-gray-800 mb-5 pb-2 border-b border-gray-100">
+                    Email Template
+                  </h2>
+                  
+                  <div className="space-y-5">
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1.5">
+                        To
+                      </label>
+                      <div className="relative">
+                        <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                          <Mail className="h-5 w-5 text-gray-400" />
+                        </div>
+                        <div className="flex flex-wrap items-center w-full pl-10 pr-3 py-2 border border-gray-200 rounded-lg focus-within:ring-2 focus-within:ring-[#92C7CF] focus-within:border-[#92C7CF] shadow-sm bg-white min-h-[48px]">
+                          {/* Email recipients as chips */}
+                          {emailRecipients.map(email => (
+                            <div 
+                              key={email}
+                              className="inline-flex items-center mr-2 mb-1 mt-1 bg-blue-50 text-blue-800 rounded-full px-2 py-1 text-sm"
+                            >
+                              <span className="mr-1">{email}</span>
+                              <button 
+                                type="button"
+                                onClick={() => handleRemoveEmailRecipient(email)}
+                                className="text-blue-500 hover:text-blue-700 focus:outline-none"
+                              >
+                                <X className="h-4 w-4" />
+                              </button>
+                            </div>
+                          ))}
+                          {/* Input field */}
+                          <form className="flex-grow" onSubmit={handleAddEmailRecipient}>
+                            <input
+                              type="email"
+                              className="w-full py-1 outline-none bg-transparent"
+                              placeholder={emailRecipients.length === 0 ? "Recipient email" : ""}
+                              value={emailInput}
+                              onChange={(e) => setEmailInput(e.target.value)}
+                              onKeyDown={handleEmailKeyDown}
+                            />
+                          </form>
+                        </div>
+                      </div>
+                      {emailStatus === 'sending' && (
+                        <div className="text-xs text-blue-500 mt-1 flex items-center">
+                          <div className="w-3 h-3 mr-1 border-2 border-blue-200 border-t-blue-500 rounded-full animate-spin"></div>
+                          Sending email...
+                        </div>
+                      )}
+                      {emailStatus === 'sent' && (
+                        <div className="text-xs text-green-500 mt-1">
+                          Email sent successfully!
+                        </div>
+                      )}
+                      {emailStatus === 'draft-saved' && (
+                        <div className="text-xs text-green-500 mt-1">
+                          Draft saved successfully!
+                        </div>
+                      )}
+                    </div>
+                    
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1.5">
+                        Subject
+                      </label>
+                      <input
+                        type="text"
+                        className="w-full px-4 py-3 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#92C7CF] focus:border-[#92C7CF] shadow-sm"
+                        placeholder="Session summary for [Patient Name]"
+                        value={emailSubject}
+                        onChange={(e) => setEmailSubject(e.target.value)}
+                        style={{backgroundColor: 'white'}}
+                      />
+                    </div>
+                    
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1.5">
+                        Message
+                      </label>
+                      <div className="border border-gray-200 rounded-lg shadow-sm overflow-hidden">
+                        {/* Removed the toolbar buttons */}
+                        <textarea
+                          className="w-full p-4 border-0 focus:outline-none focus:ring-0"
+                          rows={12}
+                          placeholder="Enter your message here..."
+                          style={{
+                            backgroundColor: 'white',
+                            resize: 'vertical',
+                            minHeight: '300px',
+                          }}
+                          value={emailBody}
+                          onChange={(e) => setEmailBody(e.target.value)}
+                        ></textarea>
+                      </div>
+                    </div>
+                    
+                    <div className="flex justify-end space-x-3 pt-2">
+                      <button 
+                        onClick={handleSaveDraft}
+                        disabled={emailStatus === 'sending'}
+                        className="px-4 py-2.5 border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors"
+                        style={{
+                          backgroundColor: 'white', 
+                          color: '#4B5563', 
+                          boxShadow: '0 1px 2px rgba(0, 0, 0, 0.05)'
+                        }}
+                      >
+                        Save Draft
+                      </button>
+                      <button 
+                        onClick={handleSendEmail}
+                        disabled={emailStatus === 'sending'}
+                        className={`px-4 py-2.5 rounded-lg transition-colors flex items-center ${
+                          emailStatus === 'sending' ? 'opacity-75 cursor-not-allowed' : ''
+                        }`}
+                        style={{
+                          backgroundColor: '#92C7CF', 
+                          color: 'white', 
+                          fontWeight: '500',
+                          boxShadow: '0 1px 2px rgba(0, 0, 0, 0.1)'
+                        }}
+                      >
+                        {emailStatus === 'sending' ? (
+                          <>
+                            <div className="w-4 h-4 mr-2 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                            Sending...
+                          </>
+                        ) : (
+                          <>
+                            <Mail className="w-4 h-4 mr-2" />
+                            Send Email
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+          
+          {/* Footer with actions */}
+          <div className="bg-white border-t border-gray-200 p-4 flex items-center justify-between relative">
+            {/* Success popup */}
+            {showSuccessPopup && (
+              <div className="absolute left-1/2 transform -translate-x-1/2 -top-16 bg-green-100 border border-green-400 text-green-700 px-6 py-3 rounded-lg shadow-md flex items-center">
+                <CheckCircle className="w-5 h-5 mr-2 text-green-500" />
+                <span>Email sent successfully!</span>
+              </div>
+            )}
+            
+            <a
+              href="#/"
+              className="px-4 py-2.5 text-gray-600 rounded-lg hover:bg-gray-100 transition-colors flex items-center no-underline"
+              style={{
+                background: 'none',
+                border: 'none'
+              }}
+            >
+              <ChevronLeft className="w-5 h-5 mr-1" />
+              Cancel
+            </a>
+            
+            <div className="flex items-center space-x-4">
+              {/* Custom Note Generator Button */}
+              <div className="flex items-center">
+                <button
+                  onClick={handleGenerateCustomNote}
+                  disabled={isGeneratingNote}
+                  className={`px-6 py-2.5 bg-[#6B46C1] text-white font-medium rounded-lg hover:bg-[#5A3AA8] focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[#6B46C1] flex items-center transition-all duration-300 ${
+                    isGeneratingNote ? 'opacity-75 cursor-not-allowed' : 'transform hover:-translate-y-0.5'
+                  }`}
+                  style={{
+                    backgroundColor: isGeneratingNote ? '#9F7AEA' : '#6B46C1', 
+                    color: 'white', 
+                    fontWeight: '600',
+                    boxShadow: '0 2px 4px rgba(0, 0, 0, 0.1)'
+                  }}
+                >
+                  {isGeneratingNote ? (
+                    <div className="flex items-center">
+                      <div className="w-5 h-5 mr-2 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                      <div className="flex flex-col">
+                        <span>Generating Note... {Math.round(generationProgress)}%</span>
+                        <div className="w-full bg-white bg-opacity-30 h-1 mt-1 rounded-full overflow-hidden">
+                          <div 
+                            className="h-full bg-white rounded-full" 
+                            style={{width: `${generationProgress}%`, transition: 'width 0.1s ease-in-out'}}
+                          ></div>
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      <Zap className="w-5 h-5 mr-2" />
+                      Generate Note with AI
+                    </>
+                  )}
+                </button>
+                
+                {/* OpenAI API is used by default - no settings button needed */}
+                <div className="ml-2 flex items-center">
+                  <div className="w-2.5 h-2.5 rounded-full mr-1 bg-green-500"></div>
+                  <span className="text-xs text-gray-500">OpenAI API</span>
+                </div>
+              </div>
+              
+              {/* Regular Finish Note Button */}
+              <button
+                onClick={handleFinishNote}
+                disabled={isGeneratingNote}
+                className={`px-6 py-2.5 bg-[#92C7CF] text-white font-medium rounded-lg hover:bg-[#82b7bf] focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[#AAD7D9] flex items-center transition-all duration-300 ${
+                  isGeneratingNote ? 'opacity-50 cursor-not-allowed' : 'transform hover:-translate-y-0.5'
+                }`}
+                style={{
+                  backgroundColor: '#92C7CF', 
+                  color: 'white', 
+                  fontWeight: '600',
+                  boxShadow: '0 2px 4px rgba(0, 0, 0, 0.1)'
+                }}
+              >
+                <CheckCircle className="w-5 h-5 mr-2" />
+                Finish Note
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default AudioRecordingPage;
